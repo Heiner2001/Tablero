@@ -21,6 +21,7 @@ from .views import (
     log_activity, get_pending_2fa_user, clear_pending_2fa_session, login_with_backend,
     get_two_factor_profile
 )
+from .tasks import send_board_reminders_to_all_users
 
 import logging
 logger = logging.getLogger(__name__)
@@ -190,6 +191,10 @@ def api_login(request):
             logger.info(f"2FA step - Código válido, iniciando sesión")
             login_with_backend(request, pending_user, backend)
             clear_pending_2fa_session(request)
+            
+            # IMPORTANTE: Guardar la sesión después del login para asegurar que session_key esté disponible
+            request.session.save()
+            logger.info(f"2FA step - Sesión guardada después del login. Session key: {request.session.session_key}")
             
             # Asegurar que la cookie de sesión se envíe también en login exitoso con 2FA
             response = Response({
@@ -807,6 +812,8 @@ def api_move_task(request, task_id):
     task.order = max_order + 1
     task.save()
     
+    # Registrar actividad y enviar notificación en tiempo real
+    logger.info(f"Usuario {request.user.username} moviendo tarea {task.id} de lista {old_list.id} a {new_list.id}")
     log_activity(
         request.user,
         'move_task',
@@ -814,6 +821,7 @@ def api_move_task(request, task_id):
         task=task,
         list_obj=new_list
     )
+    logger.info(f"Actividad registrada para movimiento de tarea {task.id}")
     
     return Response({
         'success': True,
@@ -1808,4 +1816,217 @@ def api_two_factor_setup(request):
         return Response({
             'success': False,
             'error': f'Error al generar configuración 2FA: {str(e)}'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def api_get_board_users_for_reminders(request):
+    """
+    Endpoint API para obtener todos los usuarios con acceso al tablero y sus tareas
+    organizadas por tipo de recordatorio. Para usar con EmailJS desde el frontend.
+    """
+    try:
+        from django.contrib.auth.models import User
+        from .models import Task, Subtask, Invitation, List
+        from django.db.models import Q
+        from django.utils import timezone
+        from datetime import timedelta
+        
+        today = timezone.now().date()
+        
+        # Obtener todos los usuarios que tienen acceso al tablero
+        users_with_lists = User.objects.filter(lists__isnull=False).distinct()
+        invited_users = User.objects.filter(received_invitations__accepted=True).distinct()
+        admin_users = User.objects.filter(sent_invitations__accepted=True).distinct()
+        all_board_users = (users_with_lists | invited_users | admin_users).distinct()
+        
+        users_data = []
+        
+        for user in all_board_users:
+            if not user.email:
+                continue
+            
+            # Obtener todas las tareas y subtareas relacionadas con este usuario
+            tasks_created = Task.objects.filter(created_by=user).select_related('list', 'created_by')
+            tasks_in_user_lists = Task.objects.filter(list__user=user).select_related('list', 'created_by')
+            
+            if Invitation.objects.filter(student=user, accepted=True).exists():
+                admin_ids = Invitation.objects.filter(
+                    student=user, accepted=True
+                ).values_list('admin_id', flat=True)
+                tasks_from_admins = Task.objects.filter(
+                    list__user_id__in=admin_ids
+                ).select_related('list', 'created_by')
+            else:
+                tasks_from_admins = Task.objects.none()
+            
+            all_user_tasks = (tasks_created | tasks_in_user_lists | tasks_from_admins).distinct()
+            subtasks_created = Subtask.objects.filter(created_by=user).select_related('task', 'task__list', 'task__created_by')
+            subtasks_from_user_tasks = Subtask.objects.filter(
+                task__in=all_user_tasks
+            ).select_related('task', 'task__list', 'task__created_by')
+            all_user_subtasks = (subtasks_created | subtasks_from_user_tasks).distinct()
+            
+            # Clasificar tareas y subtareas
+            overdue_tasks = []
+            tasks_1_3_days = []
+            tasks_4_7_days = []
+            overdue_subtasks = []
+            subtasks_1_3_days = []
+            subtasks_4_7_days = []
+            
+            for task in all_user_tasks:
+                if not task.due_date:
+                    continue
+                days_remaining = (task.due_date - today).days
+                
+                if days_remaining < 0:
+                    overdue_tasks.append({
+                        'title': task.title,
+                        'list_name': task.list.name,
+                        'due_date': task.due_date.strftime('%d/%m/%Y'),
+                        'days_overdue': abs(days_remaining)
+                    })
+                elif 1 <= days_remaining <= 3:
+                    tasks_1_3_days.append({
+                        'title': task.title,
+                        'list_name': task.list.name,
+                        'due_date': task.due_date.strftime('%d/%m/%Y'),
+                        'days_remaining': days_remaining
+                    })
+                elif 4 <= days_remaining <= 7:
+                    tasks_4_7_days.append({
+                        'title': task.title,
+                        'list_name': task.list.name,
+                        'due_date': task.due_date.strftime('%d/%m/%Y'),
+                        'days_remaining': days_remaining
+                    })
+            
+            for subtask in all_user_subtasks:
+                if not subtask.due_date or subtask.completed:
+                    continue
+                days_remaining = (subtask.due_date - today).days
+                
+                if days_remaining < 0:
+                    overdue_subtasks.append({
+                        'title': subtask.title,
+                        'task_title': subtask.task.title,
+                        'list_name': subtask.task.list.name,
+                        'due_date': subtask.due_date.strftime('%d/%m/%Y'),
+                        'days_overdue': abs(days_remaining)
+                    })
+                elif 1 <= days_remaining <= 3:
+                    subtasks_1_3_days.append({
+                        'title': subtask.title,
+                        'task_title': subtask.task.title,
+                        'list_name': subtask.task.list.name,
+                        'due_date': subtask.due_date.strftime('%d/%m/%Y'),
+                        'days_remaining': days_remaining
+                    })
+                elif 4 <= days_remaining <= 7:
+                    subtasks_4_7_days.append({
+                        'title': subtask.title,
+                        'task_title': subtask.task.title,
+                        'list_name': subtask.task.list.name,
+                        'due_date': subtask.due_date.strftime('%d/%m/%Y'),
+                        'days_remaining': days_remaining
+                    })
+            
+            # Solo incluir usuarios que tienen tareas pendientes
+            total_items = (len(overdue_tasks) + len(tasks_1_3_days) + len(tasks_4_7_days) +
+                          len(overdue_subtasks) + len(subtasks_1_3_days) + len(subtasks_4_7_days))
+            
+            if total_items > 0:
+                users_data.append({
+                    'username': user.username,
+                    'email': user.email,
+                    'full_name': user.get_full_name() or user.username,
+                    'overdue_tasks': overdue_tasks,
+                    'tasks_1_3_days': tasks_1_3_days,
+                    'tasks_4_7_days': tasks_4_7_days,
+                    'overdue_subtasks': overdue_subtasks,
+                    'subtasks_1_3_days': subtasks_1_3_days,
+                    'subtasks_4_7_days': subtasks_4_7_days,
+                    'total_items': total_items
+                })
+        
+        return Response({
+            'success': True,
+            'users': users_data,
+            'total_users': len(users_data)
+        })
+        
+    except Exception as e:
+        logger.error(f"Error al obtener usuarios del tablero: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return Response({
+            'success': False,
+            'error': f'Error al obtener usuarios: {str(e)}'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def api_send_board_reminders(request):
+    """
+    Endpoint API para enviar recordatorios por correo a todos los usuarios del tablero.
+    Usa Celery para procesar el envío de forma asíncrona.
+    """
+    try:
+        data = request.data
+        include_overdue = data.get('include_overdue', True)
+        include_1_3_days = data.get('include_1_3_days', True)
+        include_4_7_days = data.get('include_4_7_days', False)
+        
+        if not (include_overdue or include_1_3_days or include_4_7_days):
+            return Response({
+                'success': False,
+                'error': 'Debes seleccionar al menos una opción de recordatorio'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Intentar ejecutar la tarea de Celery de forma asíncrona
+        # Si Celery no está disponible, ejecutar de forma síncrona
+        try:
+            task = send_board_reminders_to_all_users.delay(
+                include_overdue=include_overdue,
+                include_1_3_days=include_1_3_days,
+                include_4_7_days=include_4_7_days
+            )
+            
+            logger.info(f"Tarea de recordatorios iniciada por {request.user.username}. Task ID: {task.id}")
+            
+            return Response({
+                'success': True,
+                'message': 'Los recordatorios se están enviando. Esto puede tomar unos momentos.',
+                'task_id': task.id
+            })
+        except Exception as celery_error:
+            # Si Celery no está disponible, ejecutar de forma síncrona
+            logger.warning(f"Celery no disponible, ejecutando de forma síncrona: {celery_error}")
+            try:
+                result = send_board_reminders_to_all_users(
+                    include_overdue=include_overdue,
+                    include_1_3_days=include_1_3_days,
+                    include_4_7_days=include_4_7_days
+                )
+                
+                return Response({
+                    'success': True,
+                    'message': f'Se enviaron {result.get("emails_sent", 0)} correo(s) exitosamente.',
+                    'emails_sent': result.get('emails_sent', 0),
+                    'errors': result.get('errors', 0)
+                })
+            except Exception as sync_error:
+                logger.error(f"Error al ejecutar recordatorios de forma síncrona: {sync_error}")
+                raise
+        
+    except Exception as e:
+        logger.error(f"Error al iniciar envío de recordatorios: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return Response({
+            'success': False,
+            'error': f'Error al enviar recordatorios: {str(e)}'
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

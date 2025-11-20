@@ -212,6 +212,12 @@ CELERY_BEAT_SCHEDULE = {
         'schedule': 60.0 * 60.0 * 24.0,  # cada 24 horas (en segundos)
         # Para pruebas, puedes usar: crontab(hour=9, minute=0) para ejecutar a las 9 AM diariamente
     },
+    'send-board-reminders-daily': {
+        'task': 'kanban.tasks.send_board_reminders_to_all_users',
+        'schedule': 60.0 * 60.0 * 24.0,  # cada 24 horas (en segundos)
+        # Envía recordatorios a todos los usuarios del tablero diariamente
+        # Por defecto: vencidas y 1-3 días habilitados, 4-7 días deshabilitado
+    },
 }
 
 # Configuración de correo electrónico

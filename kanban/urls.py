@@ -48,5 +48,6 @@ urlpatterns = [
     path('two-factor/setup/', views.two_factor_setup, name='two_factor_setup'),
     # API endpoints para React
     path('api/user/', views.api_get_current_user, name='api_get_current_user'),
+    path('api/board-users-for-reminders/', views.api_board_users_for_reminders, name='api_board_users_for_reminders'),
 ]
 

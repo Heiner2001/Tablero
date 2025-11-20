@@ -65,5 +65,9 @@ urlpatterns = [
     
     # 2FA Setup
     path('two-factor-setup/', api_views.api_two_factor_setup, name='two_factor_setup'),
+    
+    # Recordatorios
+    path('send-board-reminders/', api_views.api_send_board_reminders, name='send_board_reminders'),
+    path('board-users-for-reminders/', api_views.api_get_board_users_for_reminders, name='get_board_users_for_reminders'),
 ]
 

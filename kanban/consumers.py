@@ -11,11 +11,21 @@ class ActivityConsumer(AsyncWebsocketConsumer):
 
     async def connect(self):
         logger.info(f"Intentando conectar WebSocket. Path: {self.scope.get('path')}")
+        
+        # Log de headers y cookies para debugging
+        headers = dict(self.scope.get('headers', []))
+        cookies = self.scope.get('cookies', {})
+        logger.info(f"Headers recibidos: {headers}")
+        logger.info(f"Cookies recibidas: {cookies}")
+        logger.info(f"Session key: {self.scope.get('session', {}).get('_session_key', 'No session')}")
+        
         user = self.scope.get('user')
         logger.info(f"Usuario en scope: {user}, autenticado: {user.is_authenticated if user else False}")
         
         if not user or not user.is_authenticated:
             logger.warning(f"Usuario no autenticado, cerrando conexión. User: {user}")
+            logger.warning(f"Cookies disponibles: {cookies}")
+            logger.warning(f"Session disponible: {self.scope.get('session', {})}")
             await self.close(code=4001)
             return
 

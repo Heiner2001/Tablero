@@ -1544,7 +1544,7 @@ def get_max_attachment_size():
 @login_required
 @require_POST
 def send_calendar_reminders(request):
-    """Enviar recordatorios por correo desde el calendario"""
+    """Enviar recordatorios por correo desde el calendario a todos los usuarios del tablero"""
     try:
         data = json.loads(request.body)
         send_overdue = data.get('overdue', False)
@@ -1557,203 +1557,37 @@ def send_calendar_reminders(request):
                 'error': 'Debes seleccionar al menos una opción'
             }, status=400)
         
-        board_user = get_user_for_board(request.user)
-        today = timezone.now().date()
+        # Usar la función que envía a todos los usuarios del tablero
+        from .tasks import send_board_reminders_to_all_users
         
-        from django.core.mail import send_mail
+        # Mapear las opciones del frontend a los parámetros de la función
+        include_1_3_days = send_soon  # "soon" = 1-3 días
+        include_4_7_days = send_week   # "week" = 4-7 días
         
-        reminders_sent = 0
-        errors = 0
-        recipients_set = set()
+        # Ejecutar la función de forma síncrona (ya que el endpoint original es síncrono)
+        result = send_board_reminders_to_all_users(
+            include_overdue=send_overdue,
+            include_1_3_days=include_1_3_days,
+            include_4_7_days=include_4_7_days
+        )
         
-        # Tareas y subtareas vencidas
-        if send_overdue:
-            overdue_tasks = Task.objects.filter(
-                list__user=board_user,
-                due_date__lt=today,
-                reminder_sent=False
-            ).select_related('created_by', 'list').prefetch_related('subtasks')
-            
-            for task in overdue_tasks:
-                if task.created_by and task.created_by.email:
-                    recipient = task.created_by.email
-                    if recipient not in recipients_set:
-                        try:
-                            days_overdue = (today - task.due_date).days
-                            subject = f'[URGENTE] Tarea vencida: {task.title}'
-                            message = f'''Hola {task.created_by.get_full_name() or task.created_by.username},
-
-La tarea "{task.title}" está vencida desde hace {days_overdue} día(s).
-
-Fecha de vencimiento: {task.due_date.strftime("%d/%m/%Y")}
-Lista: {task.list.name}
-
-Por favor, revisa el tablero Kanban y completa esta tarea lo antes posible.
-
-Saludos,
-Sistema de Gestión Kanban'''
-                            
-                            send_mail(
-                                subject,
-                                message,
-                                settings.DEFAULT_FROM_EMAIL,
-                                [recipient],
-                                fail_silently=False,
-                            )
-                            task.reminder_sent = True
-                            task.save(update_fields=['reminder_sent'])
-                            reminders_sent += 1
-                            recipients_set.add(recipient)
-                            logger.info(f"Recordatorio de tarea vencida enviado a {recipient}")
-                        except Exception as e:
-                            errors += 1
-                            logger.error(f"Error al enviar recordatorio para tarea vencida '{task.title}': {e}", exc_info=True)
-            
-            overdue_subtasks = Subtask.objects.filter(
-                task__list__user=board_user,
-                due_date__lt=today,
-                completed=False
-            ).select_related('task', 'task__created_by', 'task__list', 'created_by')
-            
-            for subtask in overdue_subtasks:
-                recipient = None
-                if subtask.created_by and subtask.created_by.email:
-                    recipient = subtask.created_by.email
-                elif subtask.task.created_by and subtask.task.created_by.email:
-                    recipient = subtask.task.created_by.email
-                
-                if recipient and recipient not in recipients_set:
-                    try:
-                        days_overdue = (today - subtask.due_date).days
-                        subject = f'[URGENTE] Subtarea vencida: {subtask.title}'
-                        message = f'''Hola {subtask.task.created_by.get_full_name() or subtask.task.created_by.username},
-
-La subtarea "{subtask.title}" de la tarea "{subtask.task.title}" está vencida desde hace {days_overdue} día(s).
-
-Fecha de vencimiento: {subtask.due_date.strftime("%d/%m/%Y")}
-Tarea: {subtask.task.title}
-Lista: {subtask.task.list.name}
-
-Por favor, revisa el tablero Kanban y completa esta subtarea lo antes posible.
-
-Saludos,
-Sistema de Gestión Kanban'''
-                        
-                        send_mail(
-                            subject,
-                            message,
-                            settings.DEFAULT_FROM_EMAIL,
-                            [recipient],
-                            fail_silently=False,
-                        )
-                        reminders_sent += 1
-                        recipients_set.add(recipient)
-                        logger.info(f"Recordatorio de subtarea vencida enviado a {recipient}")
-                    except Exception as e:
-                        errors += 1
-                        logger.error(f"Error al enviar recordatorio para subtarea vencida '{subtask.title}': {e}", exc_info=True)
+        emails_sent = result.get('emails_sent', 0)
+        errors = result.get('errors', 0)
+        users_processed = result.get('users_processed', 0)
         
-        # Tareas que vencen en 1-3 días
-        if send_soon:
-            for days in [1, 2, 3]:
-                target_date = today + timedelta(days=days)
-                soon_tasks = Task.objects.filter(
-                    list__user=board_user,
-                    due_date=target_date,
-                    reminder_sent=False
-                ).select_related('created_by', 'list')
-                
-                for task in soon_tasks:
-                    if task.created_by and task.created_by.email:
-                        recipient = task.created_by.email
-                        if recipient not in recipients_set:
-                            try:
-                                subject = f'[URGENTE] Tarea vence en {days} día(s): {task.title}' if days == 1 else f'Recordatorio: Tarea vence en {days} días - {task.title}'
-                                message = f'''Hola {task.created_by.get_full_name() or task.created_by.username},
-
-Esta es un recordatorio de que la tarea "{task.title}" vence en {days} día(s).
-
-Fecha de vencimiento: {task.due_date.strftime("%d/%m/%Y")}
-Lista: {task.list.name}
-
-Por favor, revisa el tablero Kanban para asegurarte de que el trabajo esté en curso.
-
-Saludos,
-Sistema de Gestión Kanban'''
-                                
-                                send_mail(
-                                    subject,
-                                    message,
-                                    settings.DEFAULT_FROM_EMAIL,
-                                    [recipient],
-                                    fail_silently=False,
-                                )
-                                task.reminder_sent = True
-                                task.save(update_fields=['reminder_sent'])
-                                reminders_sent += 1
-                                recipients_set.add(recipient)
-                                logger.info(f"Recordatorio de tarea próxima enviado a {recipient}")
-                            except Exception as e:
-                                errors += 1
-                                logger.error(f"Error al enviar recordatorio para tarea próxima '{task.title}': {e}", exc_info=True)
-        
-        # Tareas que vencen en 4-7 días
-        if send_week:
-            for days in [4, 5, 6, 7]:
-                target_date = today + timedelta(days=days)
-                week_tasks = Task.objects.filter(
-                    list__user=board_user,
-                    due_date=target_date,
-                    reminder_sent=False
-                ).select_related('created_by', 'list')
-                
-                for task in week_tasks:
-                    if task.created_by and task.created_by.email:
-                        recipient = task.created_by.email
-                        if recipient not in recipients_set:
-                            try:
-                                subject = f'Recordatorio: Tarea vence en {days} días - {task.title}'
-                                message = f'''Hola {task.created_by.get_full_name() or task.created_by.username},
-
-Esta es un recordatorio de que la tarea "{task.title}" vence en {days} día(s).
-
-Fecha de vencimiento: {task.due_date.strftime("%d/%m/%Y")}
-Lista: {task.list.name}
-
-Por favor, revisa el tablero Kanban para asegurarte de que el trabajo esté en curso.
-
-Saludos,
-Sistema de Gestión Kanban'''
-                                
-                                send_mail(
-                                    subject,
-                                    message,
-                                    settings.DEFAULT_FROM_EMAIL,
-                                    [recipient],
-                                    fail_silently=False,
-                                )
-                                task.reminder_sent = True
-                                task.save(update_fields=['reminder_sent'])
-                                reminders_sent += 1
-                                recipients_set.add(recipient)
-                                logger.info(f"Recordatorio de tarea semanal enviado a {recipient}")
-                            except Exception as e:
-                                errors += 1
-                                logger.error(f"Error al enviar recordatorio para tarea semanal '{task.title}': {e}", exc_info=True)
-        
-        message = f'Se enviaron {reminders_sent} recordatorio(s) exitosamente.'
+        message = f'Se enviaron {emails_sent} recordatorio(s) exitosamente.'
         if errors > 0:
             message += f' Hubo {errors} error(es).'
         
-        details = f'Correos enviados a {len(recipients_set)} destinatario(s) único(s).'
+        details = f'Correos enviados a {users_processed} usuario(s) con acceso al tablero.'
         
         return JsonResponse({
             'success': True,
             'message': message,
             'details': details,
-            'reminders_sent': reminders_sent,
+            'reminders_sent': emails_sent,
             'errors': errors,
-            'recipients_count': len(recipients_set)
+            'recipients_count': users_processed
         })
         
     except json.JSONDecodeError:
@@ -1765,7 +1599,7 @@ Sistema de Gestión Kanban'''
         logger.error(f"Error al enviar recordatorios desde calendario: {e}", exc_info=True)
         return JsonResponse({
             'success': False,
-            'error': f'Error al enviar correos: {str(e)}'
+            'error': f'Error al enviar recordatorios: {str(e)}'
         }, status=500)
 
 
@@ -1782,6 +1616,24 @@ def api_get_current_user(request):
             'is_superuser': request.user.is_superuser,
         }
     })
+
+
+def api_board_users_for_reminders(request):
+    """API endpoint para obtener todos los usuarios del tablero para recordatorios"""
+    try:
+        # Obtener todos los usuarios del tablero
+        # (Puedes ajustar esta consulta según tu modelo real)
+        users = User.objects.all().values('id', 'email', 'first_name', 'last_name')
+        
+        return JsonResponse({
+            'success': True,
+            'users': list(users)
+        })
+    except Exception as e:
+        return JsonResponse({
+            'success': False,
+            'error': str(e)
+        }, status=500)
 
 
 @login_required
